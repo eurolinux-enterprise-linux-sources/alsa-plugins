@@ -39,8 +39,10 @@ typedef struct snd_pcm_pulse {
 	size_t last_size;
 	size_t ptr;
 	int underrun;
+	int handle_underrun;
 
 	size_t offset;
+	int64_t written;
 
 	pa_stream *stream;
 
@@ -89,6 +91,10 @@ static int update_ptr(snd_pcm_pulse_t *pcm)
 
 	if (pcm->io.stream == SND_PCM_STREAM_CAPTURE)
 		size -= pcm->offset;
+
+	/* Prevent accidental overrun of the fake ringbuffer */
+	if (size > pcm->buffer_attr.tlength - pcm->frame_size)
+		size = pcm->buffer_attr.tlength - pcm->frame_size;
 
 	if (size > pcm->last_size) {
 		pcm->ptr += size - pcm->last_size;
@@ -424,6 +430,7 @@ static snd_pcm_sframes_t pulse_write(snd_pcm_ioplug_t * io,
 	snd_pcm_pulse_t *pcm = io->private_data;
 	const char *buf;
 	snd_pcm_sframes_t ret = 0;
+	size_t writebytes;
 
 	assert(pcm);
 
@@ -445,13 +452,16 @@ static snd_pcm_sframes_t pulse_write(snd_pcm_ioplug_t * io,
 	    (char *) areas->addr + (areas->first +
 				    areas->step * offset) / 8;
 
-	ret = pa_stream_write(pcm->stream, buf, size * pcm->frame_size, NULL, 0, 0);
+	writebytes = size * pcm->frame_size;
+	ret = pa_stream_write(pcm->stream, buf, writebytes, NULL, 0, 0);
 	if (ret < 0) {
 		ret = -EIO;
 		goto finish;
 	}
 
 	/* Make sure the buffer pointer is in sync */
+	pcm->last_size -= writebytes;
+	pcm->written += writebytes;
 	ret = update_ptr(pcm);
 	if (ret < 0)
 		goto finish;
@@ -528,6 +538,7 @@ static snd_pcm_sframes_t pulse_read(snd_pcm_ioplug_t * io,
 
 		dst_buf = (char *) dst_buf + frag_length;
 		remain_size -= frag_length;
+		pcm->last_size -= frag_length;
 	}
 
 	/* Make sure the buffer pointer is in sync */
@@ -576,6 +587,19 @@ static void stream_request_cb(pa_stream * p, size_t length, void *userdata)
 	update_active(pcm);
 }
 
+#ifndef PA_CHECK_VERSION
+#define PA_CHECK_VERSION(x, y, z)	0
+#endif
+
+#if PA_CHECK_VERSION(0,99,0)
+#define DEFAULT_HANDLE_UNDERRUN		1
+#define do_underrun_detect(pcm, p) \
+	((pcm)->written <= pa_stream_get_underflow_index(p))
+#else
+#define DEFAULT_HANDLE_UNDERRUN		0
+#define do_underrun_detect(pcm, p)	1	/* always true */
+#endif
+
 static void stream_underrun_cb(pa_stream * p, void *userdata)
 {
 	snd_pcm_pulse_t *pcm = userdata;
@@ -585,7 +609,8 @@ static void stream_underrun_cb(pa_stream * p, void *userdata)
 	if (!pcm->p)
 		return;
 
-	pcm->underrun = 1;
+	if (do_underrun_detect(pcm, p))
+		pcm->underrun = 1;
 }
 
 static void stream_latency_cb(pa_stream *p, void *userdata) {
@@ -625,6 +650,8 @@ static int pulse_pcm_poll_revents(snd_pcm_ioplug_t * io,
 		*revents = io->stream == SND_PCM_STREAM_PLAYBACK ? POLLOUT : POLLIN;
 	else
 		*revents = 0;
+
+	err = 0;
 
 finish:
 
@@ -688,8 +715,9 @@ static int pulse_prepare(snd_pcm_ioplug_t * io)
 	if (io->stream == SND_PCM_STREAM_PLAYBACK) {
 		pa_stream_set_write_callback(pcm->stream,
 					     stream_request_cb, pcm);
-		pa_stream_set_underflow_callback(pcm->stream,
-						 stream_underrun_cb, pcm);
+		if (pcm->handle_underrun)
+			pa_stream_set_underflow_callback(pcm->stream,
+							 stream_underrun_cb, pcm);
 		r = pa_stream_connect_playback(pcm->stream, pcm->device,
 					       &pcm->buffer_attr,
 					       PA_STREAM_AUTO_TIMING_UPDATE |
@@ -729,6 +757,12 @@ static int pulse_prepare(snd_pcm_ioplug_t * io)
 
 	pcm->offset = 0;
 	pcm->underrun = 0;
+	pcm->written = 0;
+
+	/* Reset fake ringbuffer */
+	pcm->last_size = 0;
+	pcm->ptr = 0;
+	update_ptr(pcm);
 
       finish:
 	pa_threaded_mainloop_unlock(pcm->p->mainloop);
@@ -788,6 +822,26 @@ static int pulse_hw_params(snd_pcm_ioplug_t * io,
 		pcm->ss.format = PA_SAMPLE_S32BE;
 		break;
 #endif
+#ifdef PA_SAMPLE_S24LE
+	case SND_PCM_FORMAT_S24_3LE:
+		pcm->ss.format = PA_SAMPLE_S24LE;
+		break;
+#endif
+#ifdef PA_SAMPLE_S24BE
+	case SND_PCM_FORMAT_S24_3BE:
+		pcm->ss.format = PA_SAMPLE_S24BE;
+		break;
+#endif
+#ifdef PA_SAMPLE_S24_32LE
+	case SND_PCM_FORMAT_S24_LE:
+		pcm->ss.format = PA_SAMPLE_S24_32LE;
+		break;
+#endif
+#ifdef PA_SAMPLE_S24_32BE
+	case SND_PCM_FORMAT_S24_BE:
+		pcm->ss.format = PA_SAMPLE_S24_32BE;
+		break;
+#endif
 	default:
 		SNDERR("PulseAudio: Unsupported format %s\n",
 			snd_pcm_format_name(io->format));
@@ -802,8 +856,9 @@ static int pulse_hw_params(snd_pcm_ioplug_t * io,
 		4 * 1024 * 1024;
 	pcm->buffer_attr.tlength =
 		io->buffer_size * pcm->frame_size;
-	pcm->buffer_attr.prebuf =
-	    (io->buffer_size - io->period_size) * pcm->frame_size;
+	if (pcm->buffer_attr.prebuf == (uint32_t)-1)
+		pcm->buffer_attr.prebuf =
+			(io->buffer_size - io->period_size) * pcm->frame_size;
 	pcm->buffer_attr.minreq = io->period_size * pcm->frame_size;
 	pcm->buffer_attr.fragsize = io->period_size * pcm->frame_size;
 
@@ -811,6 +866,31 @@ static int pulse_hw_params(snd_pcm_ioplug_t * io,
 	pa_threaded_mainloop_unlock(pcm->p->mainloop);
 
 	return err;
+}
+
+static int pulse_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params)
+{
+	snd_pcm_pulse_t *pcm = io->private_data;
+	snd_pcm_uframes_t start_threshold;
+
+	assert(pcm);
+
+	if (!pcm->p || !pcm->p->mainloop)
+		return -EBADFD;
+
+	pa_threaded_mainloop_lock(pcm->p->mainloop);
+
+	snd_pcm_sw_params_get_start_threshold(params, &start_threshold);
+
+	/* At least one period to keep PulseAudio happy */
+	if (start_threshold < io->period_size)
+		start_threshold = io->period_size;
+
+	pcm->buffer_attr.prebuf = start_threshold * pcm->frame_size;
+
+	pa_threaded_mainloop_unlock(pcm->p->mainloop);
+
+	return 0;
 }
 
 static int pulse_close(snd_pcm_ioplug_t * io)
@@ -879,6 +959,7 @@ static const snd_pcm_ioplug_callback_t pulse_playback_callback = {
 	.poll_revents = pulse_pcm_poll_revents,
 	.prepare = pulse_prepare,
 	.hw_params = pulse_hw_params,
+	.sw_params = pulse_sw_params,
 	.close = pulse_close,
 	.pause = pulse_pause
 };
@@ -913,7 +994,11 @@ static int pulse_hw_constraint(snd_pcm_pulse_t * pcm)
 		SND_PCM_FORMAT_FLOAT_LE,
 		SND_PCM_FORMAT_FLOAT_BE,
 		SND_PCM_FORMAT_S32_LE,
-		SND_PCM_FORMAT_S32_BE
+		SND_PCM_FORMAT_S32_BE,
+		SND_PCM_FORMAT_S24_3LE,
+		SND_PCM_FORMAT_S24_3BE,
+		SND_PCM_FORMAT_S24_LE,
+		SND_PCM_FORMAT_S24_BE
 	};
 
 	int err;
@@ -967,6 +1052,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(pulse)
 	snd_config_iterator_t i, next;
 	const char *server = NULL;
 	const char *device = NULL;
+	const char *fallback_name = NULL;
+	int handle_underrun = DEFAULT_HANDLE_UNDERRUN;
 	int err;
 	snd_pcm_pulse_t *pcm;
 
@@ -992,9 +1079,27 @@ SND_PCM_PLUGIN_DEFINE_FUNC(pulse)
 			}
 			continue;
 		}
+		if (strcmp(id, "handle_underrun") == 0) {
+			if ((err = snd_config_get_bool(n)) < 0) {
+				SNDERR("Invalid value for %s", id);
+				return -EINVAL;
+			}
+			handle_underrun = err;
+			continue;
+		}
+		if (strcmp(id, "fallback") == 0) {
+			if (snd_config_get_string(n, &fallback_name) < 0) {
+				SNDERR("Invalid value for %s", id);
+				return -EINVAL;
+			}
+			continue;
+		}
 		SNDERR("Unknown field %s", id);
 		return -EINVAL;
 	}
+
+	if (fallback_name && name && !strcmp(name, fallback_name))
+		fallback_name = NULL; /* no fallback for the same name */
 
 	pcm = calloc(1, sizeof(*pcm));
 	if (!pcm)
@@ -1015,7 +1120,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(pulse)
 		goto error;
 	}
 
-	err = pulse_connect(pcm->p, server);
+	pcm->handle_underrun = handle_underrun;
+	pcm->buffer_attr.prebuf = -1;
+
+	err = pulse_connect(pcm->p, server, fallback_name != NULL);
 	if (err < 0)
 		goto error;
 
@@ -1047,6 +1155,10 @@ error:
 
 	free(pcm->device);
 	free(pcm);
+
+	if (fallback_name)
+		return snd_pcm_open_fallback(pcmp, root, fallback_name, name,
+					     stream, mode);
 
 	return err;
 }

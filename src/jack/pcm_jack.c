@@ -42,6 +42,7 @@ typedef struct {
 	unsigned int num_ports;
 	unsigned int hw_ptr;
 	unsigned int sample_bits;
+	snd_pcm_uframes_t min_avail;
 
 	unsigned int channels;
 	snd_pcm_channel_area_t *areas;
@@ -49,6 +50,42 @@ typedef struct {
 	jack_port_t **ports;
 	jack_client_t *client;
 } snd_pcm_jack_t;
+
+static int snd_pcm_jack_stop(snd_pcm_ioplug_t *io);
+
+static int pcm_poll_block_check(snd_pcm_ioplug_t *io)
+{
+	static char buf[32];
+	snd_pcm_sframes_t avail;
+	snd_pcm_jack_t *jack = io->private_data;
+
+	if (io->state == SND_PCM_STATE_RUNNING ||
+	    (io->state == SND_PCM_STATE_PREPARED && io->stream == SND_PCM_STREAM_CAPTURE)) {
+		avail = snd_pcm_avail_update(io->pcm);
+		if (avail >= 0 && avail < jack->min_avail) {
+			while (read(io->poll_fd, &buf, sizeof(buf)) == sizeof(buf))
+				;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int pcm_poll_unblock_check(snd_pcm_ioplug_t *io)
+{
+	static char buf[1];
+	snd_pcm_sframes_t avail;
+	snd_pcm_jack_t *jack = io->private_data;
+
+	avail = snd_pcm_avail_update(io->pcm);
+	if (avail < 0 || avail >= jack->min_avail) {
+		write(jack->fd, &buf, 1);
+		return 1;
+	}
+
+	return 0;
+}
 
 static void snd_pcm_jack_free(snd_pcm_jack_t *jack)
 {
@@ -66,6 +103,7 @@ static void snd_pcm_jack_free(snd_pcm_jack_t *jack)
 		if (jack->io.poll_fd >= 0)
 			close(jack->io.poll_fd);
 		free(jack->areas);
+		free(jack->ports);
 		free(jack);
 	}
 }
@@ -77,17 +115,15 @@ static int snd_pcm_jack_close(snd_pcm_ioplug_t *io)
 	return 0;
 }
 
-static int snd_pcm_jack_poll_revents(snd_pcm_ioplug_t *io ATTRIBUTE_UNUSED,
+static int snd_pcm_jack_poll_revents(snd_pcm_ioplug_t *io,
 				     struct pollfd *pfds, unsigned int nfds,
 				     unsigned short *revents)
 {
-	static char buf[1];
-	
 	assert(pfds && nfds == 1 && revents);
 
-	read(pfds[0].fd, buf, 1);
-
-	*revents = pfds[0].revents;
+	*revents = pfds[0].revents & ~(POLLIN | POLLOUT);
+	if (pfds[0].revents & POLLIN && !pcm_poll_block_check(io))
+		*revents |= (io->stream == SND_PCM_STREAM_PLAYBACK) ? POLLOUT : POLLIN;
 	return 0;
 }
 
@@ -103,7 +139,6 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 	snd_pcm_jack_t *jack = io->private_data;
 	const snd_pcm_channel_area_t *areas;
 	snd_pcm_uframes_t xfer = 0;
-	static char buf[1];
 	unsigned int channel;
 	
 	for (channel = 0; channel < io->channels; channel++) {
@@ -143,7 +178,7 @@ snd_pcm_jack_process_cb(jack_nframes_t nframes, snd_pcm_ioplug_t *io)
 		xfer += frames;
 	}
 
-	write(jack->fd, buf, 1); /* for polling */
+	pcm_poll_unblock_check(io); /* unblock socket for polling if needed */
 
 	return 0;
 }
@@ -152,8 +187,25 @@ static int snd_pcm_jack_prepare(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_jack_t *jack = io->private_data;
 	unsigned int i;
+	snd_pcm_sw_params_t *swparams;
+	int err;
 
 	jack->hw_ptr = 0;
+
+	jack->min_avail = io->period_size;
+	snd_pcm_sw_params_alloca(&swparams);
+	err = snd_pcm_sw_params_current(io->pcm, swparams);
+	if (err == 0) {
+		snd_pcm_sw_params_get_avail_min(swparams, &jack->min_avail);
+	}
+
+	/* deactivate jack connections if this is XRUN recovery */
+	snd_pcm_jack_stop(io);
+
+	if (io->stream == SND_PCM_STREAM_PLAYBACK)
+		pcm_poll_unblock_check(io); /* playback pcm initially accepts writes */
+	else
+		pcm_poll_block_check(io); /* block capture pcm if that's XRUN recovery */
 
 	if (jack->ports)
 		return 0;
@@ -307,7 +359,21 @@ static int parse_ports(snd_pcm_jack_t *jack, snd_config_t *conf)
 	return 0;
 }
 
+static int make_nonblock(int fd)
+{
+	int fl;
+
+	if ((fl = fcntl(fd, F_GETFL)) < 0)
+		return fl;
+
+	if (fl & O_NONBLOCK)
+		return 0;
+
+	return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
 static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
+			     const char *client_name,
 			     snd_config_t *playback_conf,
 			     snd_config_t *capture_conf,
 			     snd_pcm_stream_t stream, int mode)
@@ -341,20 +407,27 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 		return -EINVAL;
 	}
 
-	if (snprintf(jack_client_name, sizeof(jack_client_name), "alsa-jack.%s%s.%d.%d", name,
-		     stream == SND_PCM_STREAM_PLAYBACK ? "P" : "C", getpid(), num++)
-	    >= (int)sizeof(jack_client_name)) {
+	if (client_name == NULL)
+		err = snprintf(jack_client_name, sizeof(jack_client_name),
+			       "alsa-jack.%s%s.%d.%d", name,
+			       stream == SND_PCM_STREAM_PLAYBACK ? "P" : "C",
+			       getpid(), num++);
+	else
+		err = snprintf(jack_client_name, sizeof(jack_client_name),
+			       "%s", client_name);
+
+	if (err >= (int)sizeof(jack_client_name)) {
 		fprintf(stderr, "%s: WARNING: JACK client name '%s' truncated to %d characters, might not be unique\n",
 			__func__, jack_client_name, (int)strlen(jack_client_name));
 	}
 
-	jack->client = jack_client_new(jack_client_name);
+	jack->client = jack_client_open(jack_client_name, JackNoStartServer, NULL);
 
 	if (jack->client == 0) {
 		snd_pcm_jack_free(jack);
 		return -ENOENT;
 	}
-	
+
 	jack->areas = calloc(jack->channels, sizeof(snd_pcm_channel_area_t));
 	if (! jack->areas) {
 		snd_pcm_jack_free(jack);
@@ -363,6 +436,9 @@ static int snd_pcm_jack_open(snd_pcm_t **pcmp, const char *name,
 
 	socketpair(AF_LOCAL, SOCK_STREAM, 0, fd);
 	
+	make_nonblock(fd[0]);
+	make_nonblock(fd[1]);
+
 	jack->fd = fd[0];
 
 	jack->io.version = SND_PCM_IOPLUG_VERSION;
@@ -396,6 +472,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(jack)
 	snd_config_iterator_t i, next;
 	snd_config_t *playback_conf = NULL;
 	snd_config_t *capture_conf = NULL;
+	const char *client_name = NULL;
 	int err;
 	
 	snd_config_for_each(i, next, conf) {
@@ -405,6 +482,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(jack)
 			continue;
 		if (strcmp(id, "comment") == 0 || strcmp(id, "type") == 0 || strcmp(id, "hint") == 0)
 			continue;
+		if (strcmp(id, "name") == 0) {
+			snd_config_get_string(n, &client_name);
+			continue;
+		}
 		if (strcmp(id, "playback_ports") == 0) {
 			if (snd_config_get_type(n) != SND_CONFIG_TYPE_COMPOUND) {
 				SNDERR("Invalid type for %s", id);
@@ -425,7 +506,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(jack)
 		return -EINVAL;
 	}
 
-	err = snd_pcm_jack_open(pcmp, name, playback_conf, capture_conf, stream, mode);
+	err = snd_pcm_jack_open(pcmp, name, client_name, playback_conf, capture_conf, stream, mode);
 
 	return err;
 }

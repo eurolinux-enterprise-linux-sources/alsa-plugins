@@ -1,7 +1,9 @@
 AC_PREREQ(2.59)
-AC_INIT(oss/pcm_oss.c)
-AM_INIT_AUTOMAKE(alsa-plugins, 1.0.21)
+AC_INIT(alsa-plugins, 1.1.0)
+AM_INIT_AUTOMAKE
 AC_PREFIX_DEFAULT(/usr)
+
+AM_MAINTAINER_MODE([enable])
 
 AC_CONFIG_HEADERS(config.h)
 AC_CONFIG_MACRO_DIR([m4])
@@ -67,7 +69,7 @@ AC_ARG_ENABLE([avcodec],
       AS_HELP_STRING([--disable-avcodec], [Don't build plugins depending on avcodec (a52)]))
 
 if test "x$enable_avcodec" != "xno"; then
-  PKG_CHECK_MODULES(AVCODEC, [libavcodec], [HAVE_AVCODEC=yes], [HAVE_AVCODEC=no])
+  PKG_CHECK_MODULES(AVCODEC, [libavcodec libavutil], [HAVE_AVCODEC=yes], [HAVE_AVCODEC=no])
 fi
 
 if test "x$HAVE_AVCODEC" = "xno"; then
@@ -131,10 +133,14 @@ fi
 AM_CONDITIONAL(HAVE_PPH, test "$PPH" = "builtin" -o "$PPH" = "lib")
 AM_CONDITIONAL(USE_LIBSPEEX, test "$PPH" = "lib")
 
-dnl ALSA plugin directory
+if test "$PPH" = "lib"; then
+    AC_CHECK_HEADERS([speex/speexdsp_types.h])
+fi
+
 test "x$prefix" = xNONE && prefix=$ac_default_prefix
 test "x$exec_prefix" = xNONE && exec_prefix=$prefix
 
+dnl ALSA plugin directory
 AC_ARG_WITH(plugindir,
     AS_HELP_STRING([--with-plugindir=dir],
 	[path where ALSA plugin files are stored]),
@@ -150,6 +156,23 @@ fi
 AC_DEFINE_UNQUOTED(ALSA_PLUGIN_DIR, "$plugindir", [directory containing ALSA add-on modules])
 ALSA_PLUGIN_DIR="$plugindir"
 AC_SUBST(ALSA_PLUGIN_DIR)
+
+dnl ALSA data directory
+AC_ARG_WITH(alsadatadir,
+    AS_HELP_STRING([--with-alsadatadir=dir],
+	[path where ALSA data files are stored]),
+    alsadatadir="$withval", alsadatadir="")
+if test -z "$alsadatadir"; then
+    eval dir="$datadir"
+    case "$dir" in
+    /*) ;;
+    *) dir="$dir"
+    esac
+    alsadatadir="$dir/alsa"
+fi
+AC_DEFINE_UNQUOTED(ALSA_DATA_DIR, "$alsadatadir", [directory containing ALSA data files])
+ALSA_DATA_DIR="$alsadatadir"
+AC_SUBST(ALSA_DATA_DIR)
 
 SAVE_PLUGINS_VERSION
 

@@ -5,8 +5,8 @@
 %endif
 
 Name:           alsa-plugins
-Version:        1.0.21
-Release:        3%{?dist}
+Version:        1.1.0
+Release:        1%{?dist}
 Summary:        The Advanced Linux Sound Architecture (ALSA) Plugins
 # All packages are LGPLv2+ with the exception of samplerate which is GPLv2+
 License:        GPLv2+ and LGPLv2+ and BSD
@@ -173,6 +173,8 @@ install -m 644 %SOURCE2 \
 # pulseaudio configuration file
 install -m 644 %SOURCE7 \
                ${RPM_BUILD_ROOT}%{_sysconfdir}/alsa
+# remove new files
+rm -rf ${RPM_BUILD_ROOT}/usr/share/alsa/alsa.conf.d/
 
 find $RPM_BUILD_ROOT -name "*.la" -exec rm {} \;
 
@@ -262,6 +264,10 @@ rm -rf $RPM_BUILD_ROOT
 
 
 %changelog
+* Mon Jan 12 2016 Jaroslav Kysela <jkysela@redhat.com> - 1.1.0-1
+- Updated to 1.1.0
+- Resolves: rhbz#749335
+
 * Mon Jan 11 2010 Nikola Pajkovsky <npajkovs@redhat.com> - 1.0.21-3
 - add BSD license
 

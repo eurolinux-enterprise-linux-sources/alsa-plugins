@@ -26,6 +26,41 @@
 #include <alsa/pcm_external.h>
 #include <alsa/pcm_plugin.h>
 #include AVCODEC_HEADER
+#include <libavutil/avutil.h>
+
+/* some compatibility wrappers */
+#ifndef AV_VERSION_INT
+#define AV_VERSION_INT(a, b, c) (((a) << 16) | ((b) << 8) | (c))
+#endif
+#ifndef LIBAVCODEC_VERSION_INT
+#define LIBAVCODEC_VERSION_INT  AV_VERSION_INT(LIBAVCODEC_VERSION_MAJOR, \
+                                               LIBAVCODEC_VERSION_MINOR, \
+                                               LIBAVCODEC_VERSION_MICRO)
+#endif
+
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(53, 34, 0)
+#include <libavutil/audioconvert.h>
+#include <libavutil/mem.h>
+#define USE_AVCODEC_FRAME
+#endif
+
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(54, 0, 0)
+#ifndef AV_CH_LAYOUT_STEREO
+#define AV_CH_LAYOUT_STEREO	CH_LAYOUT_STEREO
+#define AV_CH_LAYOUT_QUAD	CH_LAYOUT_QUAD
+#define AV_CH_LAYOUT_5POINT1	CH_LAYOUT_5POINT1
+#endif
+#endif
+
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(52, 95, 0)
+#ifndef AV_SAMPLE_FMT_S16
+#define AV_SAMPLE_FMT_S16	SAMPLE_FMT_S16
+#endif
+#endif
+
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(54, 25, 0)
+#define AV_CODEC_ID_AC3 CODEC_ID_AC3
+#endif
 
 struct a52_ctx {
 	snd_pcm_ioplug_t io;
@@ -33,6 +68,7 @@ struct a52_ctx {
 	AVCodec *codec;
 	AVCodecContext *avctx;
 	snd_pcm_format_t format;
+	int av_format;
 	unsigned int channels;
 	unsigned int rate;
 	unsigned int bitrate;
@@ -45,16 +81,44 @@ struct a52_ctx {
 	unsigned int slave_period_size;
 	unsigned int slave_buffer_size;
 	snd_pcm_hw_params_t *hw_params;
+#ifdef USE_AVCODEC_FRAME
+	AVFrame *frame;
+	int is_planar;
+#endif
 };
+
+#ifdef USE_AVCODEC_FRAME
+#define use_planar(rec)		(rec)->is_planar
+#else
+#define use_planar(rec)		0
+#endif
+
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(53, 34, 0)
+static int do_encode(struct a52_ctx *rec)
+{
+	AVPacket pkt = {
+		.data = rec->outbuf + 8,
+		.size = rec->outbuf_size - 8
+	};
+	int got_frame;
+
+	avcodec_encode_audio2(rec->avctx, &pkt, rec->frame, &got_frame);
+	return pkt.size;
+}
+#else
+static int do_encode(struct a52_ctx *rec)
+{
+	return avcodec_encode_audio(rec->avctx, rec->outbuf + 8,
+				    rec->outbuf_size - 8,
+				    rec->inbuf);
+}
+#endif
 
 /* convert the PCM data to A52 stream in IEC958 */
 static void convert_data(struct a52_ctx *rec)
 {
-	int out_bytes;
+	int out_bytes = do_encode(rec);
 
-	out_bytes = avcodec_encode_audio(rec->avctx, rec->outbuf + 8,
-					 rec->outbuf_size - 8,
-					 rec->inbuf);
 	rec->outbuf[0] = 0xf8; /* sync words */
 	rec->outbuf[1] = 0x72;
 	rec->outbuf[2] = 0x4e;
@@ -100,6 +164,20 @@ static int write_out_pending(snd_pcm_ioplug_t *io, struct a52_ctx *rec)
 /*
  * drain callback
  */
+#ifdef USE_AVCODEC_FRAME
+static void clear_remaining_planar_data(snd_pcm_ioplug_t *io)
+{
+	struct a52_ctx *rec = io->private_data;
+	unsigned int i;
+
+	for (i = 0; i < io->channels; i++)
+		memset(rec->frame->data[i] + rec->filled * 2, 0,
+		       (rec->avctx->frame_size - rec->filled) * 2);
+}
+#else
+#define clear_remaining_planar_data(io) /*NOP*/
+#endif
+
 static int a52_drain(snd_pcm_ioplug_t *io)
 {
 	struct a52_ctx *rec = io->private_data;
@@ -109,15 +187,19 @@ static int a52_drain(snd_pcm_ioplug_t *io)
 		if ((err = write_out_pending(io, rec)) < 0)
 			return err;
 		/* remaining data must be converted and sent out */
-		memset(rec->inbuf + rec->filled * io->channels, 0,
-		       (rec->avctx->frame_size - rec->filled) * io->channels * 2);
+		if (use_planar(rec))
+			clear_remaining_planar_data(io);
+		else {
+			memset(rec->inbuf + rec->filled * io->channels, 0,
+			       (rec->avctx->frame_size - rec->filled) * io->channels * 2);
+		}
 		convert_data(rec);
 	}
 	err = write_out_pending(io, rec);
 	if (err < 0)
 		return err;
-	snd_pcm_drain(rec->slave);
-	return 0;
+
+	return snd_pcm_drain(rec->slave);
 }
 
 /* check whether the areas consist of a continuous interleaved stream */
@@ -153,6 +235,17 @@ static int fill_data(snd_pcm_ioplug_t *io,
 	short *src, *dst;
 	unsigned int src_step;
 	int err;
+	static unsigned int ch_index[3][6] = {
+		{ 0, 1 },
+		{ 0, 1, 2, 3 },
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(52, 26, 0)
+		/* current libavcodec expects SMPTE order */
+		{ 0, 1, 4, 5, 2, 3 },
+#else
+		/* libavcodec older than r18540 expects A52 order */
+		{ 0, 4, 1, 2, 3, 5 },
+#endif
+	};
 
 	if ((err = write_out_pending(io, rec)) < 0)
 		return err;
@@ -161,25 +254,28 @@ static int fill_data(snd_pcm_ioplug_t *io,
 		size = len;
 
 	dst = rec->inbuf + rec->filled * io->channels;
-	if (interleaved) {
+	if (!use_planar(rec) && interleaved) {
 		memcpy(dst, areas->addr + offset * io->channels * 2,
 		       size * io->channels * 2);
 	} else {
 		unsigned int i, ch, dst_step;
 		short *dst1;
-		static unsigned int ch_index[3][6] = {
-			{ 0, 1 },
-			{ 0, 1, 2, 3 },
-			{ 0, 4, 1, 2, 3, 5 },
-		};
+
 		/* flatten copy to n-channel interleaved */
 		dst_step = io->channels;
 		for (ch = 0; ch < io->channels; ch++, dst++) {
 			const snd_pcm_channel_area_t *ap;
 			ap = &areas[ch_index[io->channels / 2 - 1][ch]];
-			dst1 = dst;
 			src = (short *)(ap->addr +
 					(ap->first + offset * ap->step) / 8);
+
+#ifdef USE_AVCODEC_FRAME
+			if (use_planar(rec)) {
+				memcpy(rec->frame->data[ch], src, size * 2);
+				continue;
+			}
+#endif
+			dst1 = dst;
 			src_step = ap->step / 16; /* in word */
 			for (i = 0; i < size; i++) {
 				*dst1 = *src;
@@ -386,16 +482,20 @@ static int a52_start(snd_pcm_ioplug_t *io)
 {
 	struct a52_ctx *rec = io->private_data;
 
-	snd_pcm_start(rec->slave);
-	return 0;
+	/* When trying to start a PCM that's already running, the result is
+	   EBADFD. We might have implicitly started the buffer by filling it
+	   up, so just ignore this request if we're already running. */
+	if (snd_pcm_state(rec->slave) == SND_PCM_STATE_RUNNING)
+		return 0;
+
+	return snd_pcm_start(rec->slave);
 }
 
 static int a52_stop(snd_pcm_ioplug_t *io)
 {
 	struct a52_ctx *rec = io->private_data;
 
-	snd_pcm_drop(rec->slave);
-	return 0;
+	return snd_pcm_drop(rec->slave);
 }
 
 /* release resources */
@@ -406,6 +506,19 @@ static void a52_free(struct a52_ctx *rec)
 		av_free(rec->avctx);
 		rec->avctx = NULL;
 	}
+
+#ifdef USE_AVCODEC_FRAME
+	if (rec->frame) {
+		av_freep(&rec->frame->data[0]);
+		rec->inbuf = NULL;
+	}
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(54, 28, 0)
+	avcodec_free_frame(&rec->frame);
+#else
+	av_freep(&rec->frame);
+#endif
+#endif
+
 	free(rec->inbuf);
 	rec->inbuf = NULL;
 	free(rec->outbuf);
@@ -417,29 +530,87 @@ static void a52_free(struct a52_ctx *rec)
  *
  * Allocate internal buffers and set up libavcodec
  */
+
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(52, 3, 0)
+static void set_channel_layout(snd_pcm_ioplug_t *io)
+{
+	struct a52_ctx *rec = io->private_data;
+	switch (io->channels) {
+	case 2:
+		rec->avctx->channel_layout = AV_CH_LAYOUT_STEREO;
+		break;
+	case 4:
+		rec->avctx->channel_layout = AV_CH_LAYOUT_QUAD;
+		break;
+	case 6:
+		rec->avctx->channel_layout = AV_CH_LAYOUT_5POINT1;
+		break;
+	default:
+		break;
+	}
+}
+#else
+#define set_channel_layout(io) /* NOP */
+#endif
+
+static int alloc_input_buffer(snd_pcm_ioplug_t *io)
+{
+	struct a52_ctx *rec = io->private_data;
+#ifdef USE_AVCODEC_FRAME
+	rec->frame = avcodec_alloc_frame();
+	if (!rec->frame)
+		return -ENOMEM;
+	if (av_samples_alloc(rec->frame->data, rec->frame->linesize,
+			     io->channels, rec->avctx->frame_size,
+			     rec->avctx->sample_fmt, 0) < 0)
+		return -ENOMEM;
+	rec->frame->nb_samples = rec->avctx->frame_size;
+	rec->inbuf = (short *)rec->frame->data[0];
+#else
+	rec->inbuf = malloc(rec->avctx->frame_size * 2 * io->channels);
+#endif
+	if (!rec->inbuf)
+		return -ENOMEM;
+	return 0;
+}
+
 static int a52_prepare(snd_pcm_ioplug_t *io)
 {
 	struct a52_ctx *rec = io->private_data;
+	int err;
 
 	a52_free(rec);
 
+#ifdef USE_AVCODEC_FRAME
+	rec->avctx = avcodec_alloc_context3(rec->codec);
+#else
 	rec->avctx = avcodec_alloc_context();
-	if (! rec->avctx)
+#endif
+	if (!rec->avctx)
 		return -ENOMEM;
 
 	rec->avctx->bit_rate = rec->bitrate * 1000;
 	rec->avctx->sample_rate = io->rate;
 	rec->avctx->channels = io->channels;
+	rec->avctx->sample_fmt = rec->av_format;
 
-	if (avcodec_open(rec->avctx, rec->codec) < 0)
+	set_channel_layout(io);
+
+
+#ifdef USE_AVCODEC_FRAME
+	err = avcodec_open2(rec->avctx, rec->codec, NULL);
+#else
+	err = avcodec_open(rec->avctx, rec->codec);
+#endif
+	if (err < 0)
 		return -EINVAL;
 
-	rec->inbuf = malloc(rec->avctx->frame_size * 2 * io->channels);
-	if (! rec->inbuf)
-		return -ENOMEM;
 	rec->outbuf_size = rec->avctx->frame_size * 4;
 	rec->outbuf = malloc(rec->outbuf_size);
 	if (! rec->outbuf)
+		return -ENOMEM;
+
+	if (alloc_input_buffer(io))
 		return -ENOMEM;
 
 	rec->transfer = 0;
@@ -481,10 +652,60 @@ static int a52_close(snd_pcm_ioplug_t *io)
 
 	a52_free(rec);
 	if (rec->slave)
-		snd_pcm_close(rec->slave);
+		return snd_pcm_close(rec->slave);
 	return 0;
 }
 			      
+#if SND_PCM_IOPLUG_VERSION >= 0x10002
+static unsigned int chmap4[4] = {
+	SND_CHMAP_FL, SND_CHMAP_FR,
+	SND_CHMAP_RL, SND_CHMAP_RR,
+};
+static unsigned int chmap6[6] = {
+	SND_CHMAP_FL, SND_CHMAP_FR,
+	SND_CHMAP_FC, SND_CHMAP_LFE,
+	SND_CHMAP_RL, SND_CHMAP_RR,
+};
+
+static snd_pcm_chmap_query_t **a52_query_chmaps(snd_pcm_ioplug_t *io ATTRIBUTE_UNUSED)
+{
+	snd_pcm_chmap_query_t **maps;
+	int i;
+
+	maps = calloc(4, sizeof(void *));
+	if (!maps)
+		return NULL;
+	for (i = 0; i < 3; i++) {
+		snd_pcm_chmap_query_t *p;
+		p = maps[i] = calloc((i + 1) * 2 + 2, sizeof(int));
+		if (!p) {
+			snd_pcm_free_chmaps(maps);
+			return NULL;
+		}
+		p->type = SND_CHMAP_TYPE_FIXED;
+		p->map.channels = (i + 1) * 2;
+		memcpy(p->map.pos, i < 2 ? chmap4 : chmap6,
+		       (i + 1) * 2 * sizeof(int));
+	}
+	return maps;
+}
+
+static snd_pcm_chmap_t *a52_get_chmap(snd_pcm_ioplug_t *io)
+{
+	snd_pcm_chmap_t *map;
+
+	if ((io->channels % 2) || io->channels < 2 || io->channels > 6)
+		return NULL;
+	map = malloc((io->channels + 1) * sizeof(int));
+	if (!map)
+		return NULL;
+	map->channels = io->channels;
+	memcpy(map->pos, io->channels < 6 ? chmap4 : chmap6,
+	       io->channels * sizeof(int));
+	return map;
+}
+#endif /* SND_PCM_IOPLUG_VERSION >= 0x10002 */
+
 /*
  * callback table
  */
@@ -502,6 +723,10 @@ static snd_pcm_ioplug_callback_t a52_ops = {
 	.poll_descriptors_count = a52_poll_descriptors_count,
 	.poll_descriptors = a52_poll_descriptors,
 	.poll_revents = a52_poll_revents,
+#if SND_PCM_IOPLUG_VERSION >= 0x10002
+	.query_chmaps = a52_query_chmaps,
+	.get_chmap = a52_get_chmap,
+#endif /* SND_PCM_IOPLUG_VERSION >= 0x10002 */
 };
 
 /*
@@ -518,10 +743,14 @@ static snd_pcm_ioplug_callback_t a52_ops = {
 
 static int a52_set_hw_constraint(struct a52_ctx *rec)
 {
-	unsigned int accesses[] = {
+	static unsigned int accesses[] = {
 		SND_PCM_ACCESS_MMAP_INTERLEAVED,
 		SND_PCM_ACCESS_MMAP_NONINTERLEAVED,
 		SND_PCM_ACCESS_RW_INTERLEAVED,
+		SND_PCM_ACCESS_RW_NONINTERLEAVED
+	};
+	static unsigned int accesses_planar[] = {
+		SND_PCM_ACCESS_MMAP_NONINTERLEAVED,
 		SND_PCM_ACCESS_RW_NONINTERLEAVED
 	};
 	unsigned int formats[] = { SND_PCM_FORMAT_S16 };
@@ -529,9 +758,20 @@ static int a52_set_hw_constraint(struct a52_ctx *rec)
 	snd_pcm_uframes_t buffer_max;
 	unsigned int period_bytes, max_periods;
 
-	if ((err = snd_pcm_ioplug_set_param_list(&rec->io, SND_PCM_IOPLUG_HW_ACCESS,
-						 ARRAY_SIZE(accesses), accesses)) < 0 ||
-	    (err = snd_pcm_ioplug_set_param_list(&rec->io, SND_PCM_IOPLUG_HW_FORMAT,
+	if (use_planar(rec))
+		err = snd_pcm_ioplug_set_param_list(&rec->io,
+						    SND_PCM_IOPLUG_HW_ACCESS,
+						    ARRAY_SIZE(accesses_planar),
+						    accesses_planar);
+	else
+		err = snd_pcm_ioplug_set_param_list(&rec->io,
+						    SND_PCM_IOPLUG_HW_ACCESS,
+						    ARRAY_SIZE(accesses),
+						    accesses);
+	if (err < 0)
+		return err;
+
+	if ((err = snd_pcm_ioplug_set_param_list(&rec->io, SND_PCM_IOPLUG_HW_FORMAT,
 						 ARRAY_SIZE(formats), formats)) < 0 ||
 	    (err = snd_pcm_ioplug_set_param_minmax(&rec->io, SND_PCM_IOPLUG_HW_CHANNELS,
 						   rec->channels, rec->channels)) < 0 ||
@@ -676,10 +916,17 @@ SND_PCM_PLUGIN_DEFINE_FUNC(a52)
 	rec->channels = channels;
 	rec->format = format;
 
+#ifndef USE_AVCODEC_FRAME
 	avcodec_init();
+#endif
 	avcodec_register_all();
-	rec->codec = avcodec_find_encoder(CODEC_ID_AC3);
-	if (! rec->codec) {
+
+	rec->codec = avcodec_find_encoder_by_name("ac3_fixed");
+	if (rec->codec == NULL)
+		rec->codec = avcodec_find_encoder_by_name("ac3");
+	if (rec->codec == NULL) 
+		rec->codec = avcodec_find_encoder(AV_CODEC_ID_AC3);
+	if (rec->codec == NULL) {
 		SNDERR("Cannot find codec engine");
 		err = -EINVAL;
 		goto error;
@@ -713,6 +960,12 @@ SND_PCM_PLUGIN_DEFINE_FUNC(a52)
 	rec->io.mmap_rw = 0;
 	rec->io.callback = &a52_ops;
 	rec->io.private_data = rec;
+#ifdef USE_AVCODEC_FRAME
+	rec->av_format = rec->codec->sample_fmts[0];
+	rec->is_planar = av_sample_fmt_is_planar(rec->av_format);
+#else
+	rec->av_format = AV_SAMPLE_FMT_S16;
+#endif
 
 	err = snd_pcm_ioplug_create(&rec->io, name, stream, mode);
 	if (err < 0)

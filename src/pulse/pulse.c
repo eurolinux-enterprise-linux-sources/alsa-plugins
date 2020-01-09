@@ -114,6 +114,11 @@ static int make_nonblock(int fd) {
 	return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
+static int make_close_on_exec(int fd)
+{
+    return fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
 snd_pulse_t *pulse_new(void)
 {
 	snd_pulse_t *p;
@@ -134,7 +139,9 @@ snd_pulse_t *pulse_new(void)
 	p->thread_fd = fd[1];
 
 	make_nonblock(p->main_fd);
+	make_close_on_exec(p->main_fd);
 	make_nonblock(p->thread_fd);
+	make_close_on_exec(p->thread_fd);
 
 	p->mainloop = pa_threaded_mainloop_new();
 	if (!p->mainloop)
@@ -188,12 +195,18 @@ void pulse_free(snd_pulse_t * p)
 	free(p);
 }
 
-int pulse_connect(snd_pulse_t * p, const char *server)
+int pulse_connect(snd_pulse_t * p, const char *server, int can_fallback)
 {
 	int err;
+	pa_context_flags_t flags;
 	pa_context_state_t state;
 
 	assert(p);
+
+	if (can_fallback)
+		flags = PA_CONTEXT_NOAUTOSPAWN;
+	else
+		flags = 0;
 
 	if (!p->context || !p->mainloop)
 		return -EBADFD;
@@ -204,7 +217,7 @@ int pulse_connect(snd_pulse_t * p, const char *server)
 
 	pa_threaded_mainloop_lock(p->mainloop);
 
-	err = pa_context_connect(p->context, server, 0, NULL);
+	err = pa_context_connect(p->context, server, flags, NULL);
 	if (err < 0)
 		goto error;
 
@@ -225,8 +238,9 @@ int pulse_connect(snd_pulse_t * p, const char *server)
 	return 0;
 
       error:
-	SNDERR("PulseAudio: Unable to connect: %s\n",
-		pa_strerror(pa_context_errno(p->context)));
+	if (!can_fallback)
+		SNDERR("PulseAudio: Unable to connect: %s\n",
+		       pa_strerror(pa_context_errno(p->context)));
 
 	pa_threaded_mainloop_unlock(p->mainloop);
 
